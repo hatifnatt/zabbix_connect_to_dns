@@ -5,10 +5,11 @@ conf_file="/etc/zabbix/zabbix_server.conf"
 eval "$(grep '^DBName=' $conf_file)"
 eval "$(grep '^DBUser=' $conf_file)"
 eval "$(grep '^DBPassword=' $conf_file)"
+eval "$(grep '^DBHost=' $conf_file)"
 # Regex for domain validatin taken from here https://stackoverflow.com/a/41193739/2444141
 # Unit test for it https://regex101.com/r/d5Yd6j/1/tests
 domain_re="^(?=.{1,253}\.?$)(?:(?!-|[^.]+_)[A-Za-z0-9-_]{1,63}(?<!-)(?:\.|$)){2,}$"
-mysqlcmd="mysql -u$DBUser -p$DBPassword -D$DBName --batch --skip-column-names -e"
+dbtype="mysql"
 domain_name=""
 action=""
 removeip=0
@@ -19,7 +20,23 @@ echo "Usage:
   -a domain.tld         Run for all hosts which ends with 'domain.tld'
   -n host.domain.tld    Run for host 'host.domain.tld'
   -r                    Also remove IP from host
+  -t dbtype             dbtype can be postgres or mysql, mysql is default
 Note: parameters -a and -n are mutually exclusive."
+}
+
+_sqlcmd(){
+    case $dbtype in
+        mysql)
+            mysql -h${DBHost:-localhost} -u$DBUser -p$DBPassword -D$DBName --batch --skip-column-names -e "$1"
+            ;;
+        postgres)
+            psql -F' ' -q --no-align --tuples-only -c "$1"
+            ;;
+        *)
+            echo "Error: Unknown DB type: $2" >&2
+            return 1
+            ;;
+    esac
 }
 
 _validatedomain(){
@@ -32,14 +49,42 @@ _validatedomain(){
     fi
 }
 
+_testconnection(){
+    case $dbtype in
+        mysql)
+            if ! which mysql >/dev/null 2>&1; then
+                echo "Error: mysql executable not found" >&2
+                exit 1
+            fi
+            ;;
+        postgres)
+            if ! which psql >/dev/null 2>&1; then
+                echo "Error: psql executable not found" >&2
+                exit 1
+            fi
+            ;;
+        *)
+            echo "Error: Unknown DB type: $2" >&2
+            exit 1
+            ;;
+    esac
+    if err="$(_sqlcmd "\q")"; then
+        echo "Connection to $dbtype server '$DBHost' sucessfull"
+    else
+        echo "Connection to $dbtype server on '$DBHost' failed" >&2
+        echo "$err" >&2
+        exit 1
+    fi
+}
+
 _switchall(){
     if [[ $domain_name ]]; then
-        $mysqlcmd "SELECT CASE WHEN ip = '' THEN '-' ELSE ip END, dns FROM interface WHERE dns LIKE '%$domain_name';" 2> /dev/null | \
+        _sqlcmd "SELECT CASE WHEN ip = '' THEN '-' ELSE ip END, dns FROM interface WHERE dns LIKE '%$domain_name';" 2> /dev/null | \
         while read -r ip dns; do
-            $mysqlcmd "UPDATE interface SET useip = 0 WHERE dns = '$dns';" 2> /dev/null
+            _sqlcmd "UPDATE interface SET useip = 0 WHERE dns = '$dns';" && \
             echo "Host '$dns' switched to DNS."
             if [[ $removeip -eq 1 ]]; then
-                $mysqlcmd "UPDATE interface SET ip = '' WHERE dns = '$dns';" 2> /dev/null
+                _sqlcmd "UPDATE interface SET ip = '' WHERE dns = '$dns';" && \
                 echo "IP '${ip/-}' removed from host '$dns'."
             fi
         done
@@ -52,11 +97,11 @@ _switchall(){
 
 _switchone(){
     if [[ $domain_name ]]; then
-        $mysqlcmd "UPDATE interface SET useip = 0 WHERE dns = '$domain_name';" 2> /dev/null
+        _sqlcmd "UPDATE interface SET useip = 0 WHERE dns = '$domain_name';" && \
         echo "Host '$domain_name' switched to DNS."
         if [[ $removeip -eq 1 ]]; then
-            ip=$($mysqlcmd "SELECT ip FROM interface WHERE dns LIKE '%$domain_name';" 2> /dev/null)
-            $mysqlcmd "UPDATE interface SET ip = '' WHERE dns = '$domain_name';" 2> /dev/null
+            ip=$(_sqlcmd "SELECT ip FROM interface WHERE dns LIKE '%$domain_name';")
+            _sqlcmd "UPDATE interface SET ip = '' WHERE dns = '$domain_name';" && \
             echo "IP '$ip' removed from host '$domain_name'."
         fi
     else
@@ -119,6 +164,25 @@ while [ ${#} -gt 0 ]; do
             _validatedomain "$2" && echo "Valid domain."
             exit 0;
             ;;
+        -t)
+            case "$2" in
+                mysql)
+                    dbtype="mysql"
+                    ;;
+                postgres)
+                    dbtype="postgres"
+                    export PGUSER=$DBUser
+                    export PGPASSWORD=$DBPassword
+                    export PGDATABASE=$DBName
+                    export PGHOST=${DBHost:-localhost}
+                    ;;
+                *)
+                    echo "Error: Unknown DB type: $2" >&2
+                    exit 1
+                    ;;
+            esac
+            shift 2
+            ;;
         --) # End of all options
             shift
             break
@@ -136,9 +200,11 @@ done
 
 case "$action" in
     one)
+        _testconnection
         _switchone
         ;;
     all)
+        _testconnection
         _switchall
         ;;
 esac
